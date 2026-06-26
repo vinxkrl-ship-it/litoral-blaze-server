@@ -1,0 +1,14 @@
+{
+  "name": "LITORAL BLAZE 14X",
+  "short_name": "LitoralBlaze",
+  "description": "Sinais ao vivo para Double 14X",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#0d0d0f",
+  "theme_color": "#e63946",
+  "orientation": "portrait-primary",
+  "icons": [
+    { "src": "/logo.png", "sizes": "192x192", "type": "image/png" },
+    { "src": "/logo.png", "sizes": "512x512", "type": "image/png" }
+  ]
+}
