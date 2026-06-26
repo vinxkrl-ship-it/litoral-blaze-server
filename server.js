@@ -1,157 +1,162 @@
 const express = require('express');
 const cors = require('cors');
-const fetch = require('node-fetch');
+const https = require('https');
 const fs = require('fs');
 const path = require('path');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// ============================================================
-//  MIDDLEWARES
-// ============================================================
 app.use(cors());
 app.use(express.json({ limit: '5mb' }));
 
 // ============================================================
-//  STORAGE LOCAL (arquivo JSON — persiste no Render via disco)
-//  O Render tem disco efêmero, mas com o plano pago tem disco
-//  persistente. Para plano gratuito, os dados sobrevivem até
-//  o servidor reiniciar (suficiente para uso contínuo).
-//  Para garantia total, usamos arquivo + memória.
+//  STORAGE (arquivo JSON — dados globais: users, signals, etc)
 // ============================================================
 const DATA_FILE = path.join(__dirname, 'data.json');
 
 function loadData() {
   try {
-    if (fs.existsSync(DATA_FILE)) {
-      return JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
-    }
-  } catch (e) {
-    console.warn('Erro ao carregar data.json:', e.message);
-  }
+    if (fs.existsSync(DATA_FILE)) return JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
+  } catch(e) { console.warn('Erro ao carregar data.json:', e.message); }
   return {};
 }
-
 function saveData(data) {
-  try {
-    fs.writeFileSync(DATA_FILE, JSON.stringify(data, null, 2), 'utf8');
-  } catch (e) {
-    console.warn('Erro ao salvar data.json:', e.message);
-  }
+  try { fs.writeFileSync(DATA_FILE, JSON.stringify(data, null, 2), 'utf8'); }
+  catch(e) { console.warn('Erro ao salvar data.json:', e.message); }
 }
 
-// Carrega dados na memória ao iniciar
 let KV_STORE = loadData();
 
 // ============================================================
-//  ENDPOINTS KV — usados pelo index.html para dados globais
+//  ENDPOINTS KV — dados globais (users, signals, config IA)
 // ============================================================
-
-// GET /kv/:key — lê um valor
 app.get('/kv/:key', (req, res) => {
-  const key = req.params.key;
-  const value = KV_STORE[key];
-  if (value === undefined) {
-    return res.json({ key, value: null });
-  }
-  res.json({ key, value });
+  const value = KV_STORE[req.params.key];
+  res.json({ key: req.params.key, value: value !== undefined ? value : null });
 });
 
-// POST /kv/:key — salva um valor
 app.post('/kv/:key', (req, res) => {
-  const key = req.params.key;
   const { value } = req.body;
-  if (value === undefined) {
-    return res.status(400).json({ error: 'value obrigatório' });
-  }
-  KV_STORE[key] = value;
+  if (value === undefined) return res.status(400).json({ error: 'value obrigatorio' });
+  KV_STORE[req.params.key] = value;
   saveData(KV_STORE);
-  res.json({ ok: true, key, value });
+  res.json({ ok: true, key: req.params.key });
 });
 
-// DELETE /kv/:key — apaga um valor
 app.delete('/kv/:key', (req, res) => {
-  const key = req.params.key;
-  delete KV_STORE[key];
+  delete KV_STORE[req.params.key];
   saveData(KV_STORE);
-  res.json({ ok: true, key });
+  res.json({ ok: true, key: req.params.key });
 });
 
 // ============================================================
-//  ENDPOINTS DOUBLE — proxy das rodadas da Blaze em tempo real
+//  SCRAPER — bestblaze.com.br (rodadas Double em tempo real)
 // ============================================================
-const BLAZE_URL = 'https://blaze.com/api/roulette_games/recent';
-const BLAZE_DOUBLE_URL = 'https://blaze.com/api/roulette_games/recent?game_mode=NORMAL';
-
 let cachedRounds = [];
 let lastFetch = 0;
 let lastUpdate = 0;
 
+// Mapa de cores: 0 = branco, 1-7 = vermelho, 8-14 = preto
+function getColor(num) {
+  const n = parseInt(num);
+  if (n === 0) return 'white';
+  if (n >= 1 && n <= 7) return 'red';
+  return 'black';
+}
+
+function fetchHtml(url) {
+  return new Promise((resolve, reject) => {
+    const req = https.get(url, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml',
+        'Accept-Language': 'pt-BR,pt;q=0.9',
+      },
+      timeout: 10000,
+    }, (res) => {
+      let data = '';
+      res.on('data', chunk => data += chunk);
+      res.on('end', () => resolve(data));
+    });
+    req.on('error', reject);
+    req.on('timeout', () => { req.destroy(); reject(new Error('timeout')); });
+  });
+}
+
 async function fetchBlazeRounds() {
   try {
-    const urls = [
-      'https://blaze.com/api/roulette_games/recent?game_mode=NORMAL',
-      'https://blaze1.com/api/roulette_games/recent?game_mode=NORMAL',
-    ];
-    let data = null;
-    for (const url of urls) {
-      try {
-        const r = await fetch(url, {
-          headers: {
-            'Accept': 'application/json',
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-          },
-          timeout: 8000,
-        });
-        if (r.ok) { data = await r.json(); break; }
-      } catch (e) { /* tenta próxima URL */ }
+    const html = await fetchHtml('https://www.bestblaze.com.br/doubleRodadasDia');
+
+    // Extrai pares: "NUMERO HH:MM:SS" do HTML
+    // Padrão: número seguido de horário no texto
+    const matches = [];
+    // Regex: captura linhas com número e horário HH:MM:SS
+    const regex = /\b(\d{1,2})\s+(\d{2}:\d{2}:\d{2})\b/g;
+    let m;
+    while ((m = regex.exec(html)) !== null) {
+      const num = parseInt(m[1]);
+      const timeStr = m[2]; // HH:MM:SS
+      if (num >= 0 && num <= 14) {
+        matches.push({ num, timeStr });
+      }
     }
-    if (!data || !Array.isArray(data)) return;
-    const colorMap = { 0: 'white', 1: 'red', 2: 'black' };
-    const mapped = data.map(r => ({
-      id: r.id,
-      num: r.roll,
-      color: colorMap[r.color] || 'red',
-      time: r.created_at,
-    }));
-    if (mapped.length > 0) {
-      const newLatest = mapped[mapped.length - 1]?.id;
+
+    if (matches.length === 0) {
+      console.warn('Nenhuma rodada encontrada no HTML');
+      return;
+    }
+
+    // Monta data completa com a data de hoje (ajuste para fuso BRT UTC-3)
+    const todayBRT = new Date(Date.now() - 3 * 60 * 60 * 1000);
+    const dateStr = todayBRT.toISOString().slice(0, 10); // YYYY-MM-DD
+
+    const rounds = matches.map((r, i) => {
+      const isoTime = `${dateStr}T${r.timeStr}-03:00`;
+      return {
+        id: `${dateStr}-${r.timeStr}`.replace(/:/g, ''),
+        num: r.num,
+        color: getColor(r.num),
+        time: new Date(isoTime).toISOString(),
+      };
+    });
+
+    // Ordena do mais antigo pro mais recente
+    rounds.sort((a, b) => new Date(a.time) - new Date(b.time));
+
+    // Remove duplicatas por id
+    const seen = new Set();
+    const unique = rounds.filter(r => {
+      if (seen.has(r.id)) return false;
+      seen.add(r.id); return true;
+    });
+
+    if (unique.length > 0) {
+      const newLatest = unique[unique.length - 1]?.id;
       const oldLatest = cachedRounds[cachedRounds.length - 1]?.id;
       if (newLatest !== oldLatest) lastUpdate = Date.now();
-      cachedRounds = mapped;
+      cachedRounds = unique;
+      console.log(`✅ ${unique.length} rodadas carregadas | último: ${unique[unique.length-1]?.time}`);
     }
-  } catch (e) {
+  } catch(e) {
     console.warn('Erro fetchBlazeRounds:', e.message);
   }
 }
 
-// Busca rodadas a cada 2 segundos
-setInterval(fetchBlazeRounds, 2000);
-fetchBlazeRounds(); // busca imediatamente ao iniciar
+// Busca a cada 30 segundos (o site não atualiza mais rápido que isso)
+setInterval(fetchBlazeRounds, 30000);
+fetchBlazeRounds();
 
-// GET /recent — retorna últimas 30 rodadas
-app.get('/recent', async (req, res) => {
-  if (cachedRounds.length === 0) await fetchBlazeRounds();
-  const recent = cachedRounds.slice(-30);
-  res.json({
-    success: true,
-    data: recent,
-    count: recent.length,
-    lastUpdate,
-    serverTime: Date.now(),
-  });
+// ============================================================
+//  ENDPOINTS RODADAS
+// ============================================================
+app.get('/recent', (req, res) => {
+  const recent = cachedRounds.slice(-50);
+  res.json({ success: true, data: recent, count: recent.length, lastUpdate, serverTime: Date.now() });
 });
 
-// GET /load-all — retorna todas as rodadas em cache
-app.get('/load-all', async (req, res) => {
-  if (cachedRounds.length === 0) await fetchBlazeRounds();
-  res.json({
-    success: true,
-    data: cachedRounds,
-    count: cachedRounds.length,
-    lastUpdate,
-  });
+app.get('/load-all', (req, res) => {
+  res.json({ success: true, data: cachedRounds, count: cachedRounds.length, lastUpdate });
 });
 
 // ============================================================
@@ -162,6 +167,7 @@ app.get('/', (req, res) => {
     status: 'online',
     name: 'LITORAL BLAZE 14X — Server',
     rounds: cachedRounds.length,
+    lastRound: cachedRounds[cachedRounds.length - 1] || null,
     kvKeys: Object.keys(KV_STORE),
     uptime: Math.floor(process.uptime()) + 's',
     serverTime: new Date().toISOString(),
@@ -175,6 +181,7 @@ app.get('/status', (req, res) => {
     users: (KV_STORE['users'] || []).length,
     signals: (KV_STORE['signals'] || []).length,
     lastUpdate,
+    lastRound: cachedRounds[cachedRounds.length - 1] || null,
   });
 });
 
@@ -183,5 +190,4 @@ app.get('/status', (req, res) => {
 // ============================================================
 app.listen(PORT, () => {
   console.log(`✅ LITORAL BLAZE SERVER rodando na porta ${PORT}`);
-  console.log(`📦 KV Store: ${Object.keys(KV_STORE).length} chaves carregadas`);
 });
